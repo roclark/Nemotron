@@ -50,6 +50,7 @@ from nemo_runspec.display import display_job_config, display_job_submission
 from nemo_runspec.env import parse_env
 from nemo_runspec.execution import (
     build_env_vars,
+    create_executor,
     create_slurm_executor,
     execute_cloud,
     execute_cloud_ray,
@@ -158,6 +159,15 @@ def _execute_rl(cfg: RecipeConfig):
             env_vars=env_vars,
             startup_commands=startup_commands,
         )
+    elif get_executor_type(env_for_executor) == "docker":
+        _execute_docker_ray(
+            train_path=train_path,
+            env=env_for_executor,
+            passthrough=cfg.passthrough,
+            attached=cfg.attached,
+            env_vars=env_vars,
+            startup_commands=startup_commands,
+        )
     elif get_executor_type(env_for_executor) in ("dgxcloud", "lepton"):
         # ray-launch recipes (GRPO/DPO) with cloud executors go through
         # RayCluster + RayJob (speaker pattern). execute_cloud stays for
@@ -190,6 +200,96 @@ def _execute_rl(cfg: RecipeConfig):
         )
 
 
+def _execute_docker_ray(
+    train_path: Path,
+    env,
+    passthrough: list[str],
+    attached: bool,
+    env_vars: dict[str, str],
+    startup_commands: list[str] | None,
+) -> None:
+    """Run the single-node Ray training process in a Docker executor.
+
+    NeMo-Run's RayJob does not provide a Docker backend. NeMo-RL initializes
+    its own local Ray runtime from ``train.py``, so Docker only needs to launch
+    the packaged training command in one GPU-enabled container.
+    """
+    try:
+        import nemo_run as run
+    except ImportError:
+        typer.echo("Error: nemo-run is required for Docker execution", err=True)
+        typer.echo("Install with: pip install nemo-run", err=True)
+        raise typer.Exit(1)
+
+    from nemo_runspec.packaging import SelfContainedPackager
+
+    def _get(key: str, default=None):
+        if env is None:
+            return default
+        return env.get(key, default) if hasattr(env, "get") else getattr(env, key, default)
+
+    packager = SelfContainedPackager(
+        script_path=SCRIPT_PATH,
+        train_path=str(train_path),
+    )
+    executor = create_executor(
+        env=env,
+        env_vars=env_vars,
+        packager=packager,
+        attached=attached,
+        default_image=SPEC.image,
+        script_resources=SPEC.resources,
+    )
+
+    effective_workdir = _get("workdir", SPEC.run.workdir)
+    effective_pre_ray_start_commands = _get(
+        "pre_ray_start_commands",
+        PRE_RAY_START_COMMANDS,
+    )
+    effective_run_command = _get("run_command", SPEC.run.cmd)
+
+    if effective_pre_ray_start_commands is not None:
+        setup_commands = list(effective_pre_ray_start_commands)
+    else:
+        setup_commands = ["find . -type d -name __pycache__ -delete 2>/dev/null || true"]
+        if effective_workdir:
+            setup_commands.extend(
+                [
+                    f"cp {REMOTE_SCRIPT} {effective_workdir}/",
+                    f"cp {REMOTE_CONFIG} {effective_workdir}/",
+                ]
+            )
+
+    if effective_run_command:
+        cmd = effective_run_command.format(script=REMOTE_SCRIPT, config=REMOTE_CONFIG)
+        if effective_workdir:
+            cmd = f"cd {effective_workdir} && {cmd}"
+    elif effective_workdir:
+        cmd = f"cd {effective_workdir} && python {REMOTE_SCRIPT} --config {REMOTE_CONFIG}"
+    else:
+        cmd = f"uv run python {REMOTE_SCRIPT} --config {REMOTE_CONFIG}"
+
+    if passthrough:
+        import shlex
+
+        cmd += " " + shlex.join(passthrough)
+    if startup_commands:
+        cmd = prepend_startup_to_cmd(startup_commands, cmd)
+
+    script_task = run.Script(inline=" && ".join([*setup_commands, cmd]))
+    recipe_name = SPEC.name.replace("/", "-")
+    with run.Experiment(recipe_name) as exp:
+        exp.add(
+            script_task,
+            executor=executor,
+            name=recipe_name,
+            tail_logs=attached,
+        )
+        # DockerExecutor cannot detach; NeMo-Run keeps the local process alive
+        # and reports the container's final status for both --run and --batch.
+        exp.run(detach=False)
+
+
 def _execute_ray(
     train_path: Path,
     env,
@@ -201,8 +301,8 @@ def _execute_ray(
 ):
     """Execute via Ray (RayJob).
 
-    Supports Slurm, DGX Cloud, and Lepton executors. The executor type
-    is determined by ``env.executor`` in the env.toml profile.
+    Supports the Slurm executor. Docker is handled by
+    :func:`_execute_docker_ray`; cloud executors use ``execute_cloud_ray``.
 
     FORK POINT: Replace this function for different Ray submission logic.
     """
